@@ -66,43 +66,62 @@ func (t *Tailscale) Name() string { return "ts4via6" }
 func (t *Tailscale) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	log.Debug("Handling request")
 
+	handled, err := t.handleRequest(w, r)
+	if err != nil {
+		// If an error occurs during handling, log it but don't block the response
+		log.Errorf("Error handling query: %v", err)
+		return dns.RcodeServerFailure, err
+	}
+
+	if handled {
+		// If the query was handled, return the appropriate response code
+		return dns.RcodeSuccess, nil
+	}
+
+	if t.Next == nil {
+		// Return NXDOMAIN if there's no next plugin
+		return dns.RcodeNameError, nil
+	}
+
+	return t.Next.ServeDNS(ctx, w, r)
+}
+
+func (t *Tailscale) handleRequest(w dns.ResponseWriter, r *dns.Msg) (bool, error) {
 	domain := extractDomainName(r)
 	if domain == "" {
-		return plugin.NextOrFailure(t.Name(), t.Next, ctx, w, r)
+		return false, nil
 	}
 
 	sites := t.findMatchingSites(domain)
 	if len(sites) == 0 {
 		log.Debugf("Request '%s': No matching sites.", domain)
-		return plugin.NextOrFailure(t.Name(), t.Next, ctx, w, r)
-	} else {
-		log.Infof("Request '%s': %d matching sites", domain, len(sites))
+		return false, nil
 	}
 
 	response, err := forwardToAllServers(sites, r)
 	if err != nil {
-		return dns.RcodeServerFailure, err
+		return false, err
 	}
 
-	if response != nil {
-		changed := translateResponseToIPv6(response.response, response.entry.siteNumber)
+	if response == nil {
+		return false, nil
+	}
 
-		if changed {
-			err = w.WriteMsg(response.response)
-			if err != nil {
-				return dns.RcodeServerFailure, err
-			}
-			return dns.RcodeSuccess, nil
-		} else {
-			err = w.WriteMsg(response.response)
-			if err != nil {
-				return dns.RcodeServerFailure, err
-			}
-			return dns.RcodeSuccess, nil
+	changed := translateResponseToIPv6(response.response, response.entry.siteNumber)
+
+	if changed {
+		err = w.WriteMsg(response.response)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		err = w.WriteMsg(response.response)
+		if err != nil {
+			return false, err
 		}
 	}
 
-	return plugin.NextOrFailure(t.Name(), t.Next, ctx, w, r)
+	return true, nil
 }
 
 func (t *Tailscale) findMatchingSites(domain string) []*TailscaleConfigEntry {
